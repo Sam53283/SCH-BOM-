@@ -1,0 +1,512 @@
+# ==========================================
+# 0. 環境清理（自動清除上一次執行殘留的舊資料）
+# ==========================================
+import sys
+if 'google.colab' in sys.modules:
+    from IPython import get_ipython
+    print("🧹 正在清理 Colab 工作目錄中的舊檔案...")
+    get_ipython().system("find . -maxdepth 1 ! -name '.' ! -name 'sample_data' ! -name '.config' -exec rm -rf {} +")
+
+# ==========================================
+# 1. 自動安裝與導入所需套件
+# ==========================================
+import os
+import glob
+import re
+import difflib
+import requests
+
+IN_COLAB = 'google.colab' in sys.modules
+
+try:
+    import fitz  # PyMuPDF
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
+    import Levenshtein  # 確保導入 Levenshtein 套件
+except ImportError:
+    print("正在安裝必要的 PDF 與影像處理套件...")
+    if IN_COLAB:
+        from IPython import get_ipython
+        get_ipython().system('pip install -q pymupdf pillow python-Levenshtein')
+    else:
+        os.system(f"{sys.executable} -m pip install -q pymupdf pillow python-Levenshtein")
+    import fitz
+    from PIL import Image, ImageChops, ImageDraw, ImageFont
+    import Levenshtein
+
+# ==========================================
+# 2. 下載中文字型（防止中文檔名與標題變亂碼）
+# ==========================================
+font_url = "https://github.com/googlefonts/noto-cjk/raw/main/Sans/OTF/TraditionalChinese/NotoSansCJKtc-Regular.otf"
+font_path = "NotoSansCJKtc-Regular.otf"
+
+if not os.path.exists(font_path):
+    print("正在下載中文字型...")
+    try:
+        r = requests.get(font_url, allow_redirects=True, timeout=10)
+        r.raise_for_status()
+        with open(font_path, 'wb') as f:
+            f.write(r.content)
+    except Exception as e:
+        print(f"❌ 字型下載失敗: {e}，嘗試尋找系統內建中文字型...")
+        backup_fonts = [
+            "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
+            "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+            "C:\\Windows\\Fonts\\msjh.ttc",            # Windows 微軟正黑體
+            "C:\\Windows\\Fonts\\msjhbd.ttc",          # Windows 微軟正黑體粗體
+            "/System/Library/Fonts/STHeiti Light.ttc", # macOS 舊版
+            "/System/Library/Fonts/PingFang.ttc"       # macOS 新版
+        ]
+        font_path = next((f for f in backup_fonts if os.path.exists(f)), None)
+        if not font_path:
+            print("⚠️ 警告：找不到任何中文字型，將使用系統預設英文字型。")
+
+# ==========================================
+# 2.5 報告類型自動偵測功能
+# ==========================================
+def detect_emission_type(pdf_path, page_num=0):
+    try:
+        doc = fitz.open(pdf_path)
+        page = doc.load_page(page_num)
+        text = page.get_text().lower()
+        doc.close()
+        if "conducted" in text: return "Conducted"
+        elif "radiated" in text: return "Radiated"
+    except Exception as e:
+        print(f"⚠️ 讀取 PDF 文字失敗: {e}")
+    return "Unknown"
+
+# ==========================================
+# 3. 核心影像處理功能
+# ==========================================
+def process_bottom_custom_cut(img, wave_h, h, w, left_crop_ratio, right_crop_ratio, yaxis_start_ratio, yaxis_width_ratio):
+    crop_left = int(w * left_crop_ratio)
+    crop_right = int(w * (1 - right_crop_ratio))
+    yaxis_left = int(w * yaxis_start_ratio)
+    yaxis_right = int(w * (yaxis_start_ratio + yaxis_width_ratio))
+    
+    if not (crop_left < yaxis_left < yaxis_right < crop_right):
+        print("⚠️ 警告：裁切比例設定重疊或超出範圍，啟動安全保護機制。")
+        return img.crop((0, wave_h, w, h))
+        
+    left_part = img.crop((crop_left, wave_h, yaxis_left, h))
+    right_part = img.crop((yaxis_right, wave_h, crop_right, h))
+    
+    combined_w = left_part.width + right_part.width
+    combined_h = h - wave_h
+    chart_cleaned = Image.new("RGB", (combined_w, combined_h), (255, 255, 255))
+    chart_cleaned.paste(left_part, (0, 0))
+    chart_cleaned.paste(right_part, (left_part.width, 0))
+    return chart_cleaned
+
+def apply_color_mask(img, color_rgb):
+    gray = img.convert("L")
+    color_canvas = Image.new("RGB", img.size, color_rgb)
+    mask = ImageChops.invert(gray)
+    return Image.composite(color_canvas, Image.new("RGB", img.size, (255, 255, 255)), mask)
+
+def render_pdf_to_image(pdf_path, page_num=0, dpi=200):
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_num)
+    pix = page.get_pixmap(matrix=fitz.Matrix(dpi/72, dpi/72))
+    doc.close()
+    return Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+
+# ==========================================
+# 4. 結構化提取功能與跨欄位精準定位標註
+# ==========================================
+def extract_emi_table_data(pdf_path, filename, page_num=0):
+    doc = fitz.open(pdf_path)
+    page = doc.load_page(page_num)
+    rect = page.rect
+    bottom_rect = fitz.Rect(0, rect.height * 0.45, rect.width, rect.height)
+    tables = page.find_tables(clip=bottom_rect)
+    
+    table_data = []
+    for table in tables:
+        extracted_rows = table.extract()
+        if not extracted_rows or len(extracted_rows) < 2: continue
+            
+        header = [str(cell).lower().strip() for cell in extracted_rows[0]]
+        freq_idx, margin_idx, det_idx = -1, -1, -1
+        
+        for idx, col_name in enumerate(header):
+            if "freq" in col_name or "頻率" in col_name: freq_idx = idx
+            elif "margin" in col_name or "餘量" in col_name or "限值差" in col_name: margin_idx = idx
+            elif "det" in col_name or "type" in col_name or "檢波" in col_name: det_idx = idx
+                
+        if freq_idx == -1: freq_idx = 1 if len(header) > 1 else 0
+        if margin_idx == -1: margin_idx = 2 if len(header) > 2 else 0
+        if det_idx == -1: det_idx = 3 if len(header) > 3 else 0
+        
+        for r_idx, row in enumerate(extracted_rows[1:]):
+            if len(row) <= max(freq_idx, margin_idx, det_idx): continue
+            try:
+                raw_freq = str(row[freq_idx]).replace('\n', '').strip()
+                raw_margin = str(row[margin_idx]).replace('\n', '').strip()
+                raw_det = str(row[det_idx]).replace('\n', '').strip().upper()
+
+                freq_str = re.sub(r'[^\d.]', '', raw_freq)
+                margin_match = re.search(r'[-+]?\d+(?:\.\d+)?', raw_margin)
+                
+                if not freq_str or not margin_match: continue
+                    
+                freq = float(freq_str)
+                margin = float(margin_match.group())
+                
+                if "QUASI" in raw_det or "QP" in raw_det: det = "QP"
+                elif "AVERAGE" in raw_det or "AV" in raw_det or "CA" in raw_det: det = "AV"
+                else: det = "PK"
+                
+                cell_bbox = table.rows[r_idx + 1].cells[margin_idx]
+                det_bbox = table.rows[r_idx + 1].cells[det_idx]
+                
+                table_data.append({
+                    "freq": freq, "detector": det, "margin": margin, 
+                    "bbox": cell_bbox, "det_bbox": det_bbox
+                })
+            except Exception: continue
+                
+    table_data.sort(key=lambda x: x['freq'])
+    doc.close()
+    return table_data
+
+def inject_margin_diffs_to_sub_image(sub_img_b, data_a, data_b, scale_factor, left_crop, wave_h, h, w, yaxis_start, yaxis_width, font_p):
+    draw = ImageDraw.Draw(sub_img_b)
+    try:
+        font_s = ImageFont.truetype(font_p, 11) if font_p else ImageFont.load_default()
+    except Exception:
+        font_s = ImageFont.load_default()
+        
+    crop_left_px = int(w * left_crop)
+    yaxis_left_px = int(w * yaxis_start)
+    yaxis_right_px = int(w * (yaxis_start + yaxis_width))
+    
+    for item_b in data_b:
+        if not item_b.get('bbox') or not item_b.get('det_bbox'): continue
+        bx1, by1, bx2, by2 = item_b['bbox']
+        dx1, dy1, dx2, dy2 = item_b['det_bbox']
+        
+        pt_to_px = 200/72
+        margin_cx_px = ((bx1 + bx2) / 2) * pt_to_px
+        det_left_px = dx1 * pt_to_px
+        cell_cy_px = ((by1 + by2) / 2) * pt_to_px - wave_h
+        
+        if margin_cx_px > yaxis_right_px:
+            margin_cx_final = margin_cx_px - (yaxis_right_px - yaxis_left_px) - crop_left_px
+        else:
+            margin_cx_final = margin_cx_px - crop_left_px
+            
+        if det_left_px > yaxis_right_px:
+            det_left_final = det_left_px - (yaxis_right_px - yaxis_left_px) - crop_left_px
+        else:
+            det_left_final = det_left_px - crop_left_px
+            
+        margin_cx_final *= scale_factor
+        det_left_final *= scale_factor
+        cy_final = cell_cy_px * scale_factor
+        
+        matched_a = None
+        for item_a in data_a:
+            pct_diff = abs(item_b['freq'] - item_a['freq']) / item_a['freq']
+            if pct_diff <= 0.05 and item_b['detector'] == item_a['detector']:
+                matched_a = item_a
+                break
+                
+        if matched_a:
+            diff = item_b['margin'] - matched_a['margin']
+            diff_text = f"{diff:+.1f}"
+            txt_color = (200, 0, 0) if diff >= 0 else (0, 140, 0)
+            
+            gap_start = margin_cx_final + 27
+            gap_end = det_left_final - 1
+            actual_gap_w = gap_end - gap_start
+            text_width = draw.textlength(diff_text, font=font_s)
+            
+            center_offset = (actual_gap_w - text_width) / 2
+            target_x = gap_start + center_offset
+            
+            y_center = cy_final + 13
+            draw.text((target_x, y_center), diff_text, fill=txt_color, font=font_s, anchor="lm")
+            
+            # 依照條件繪製紅圈或綠圈
+            padding_x = 4  
+            padding_y = 6  
+            text_h = 11    
+            
+            x1 = int(target_x - padding_x)
+            y1 = int(y_center - (text_h / 2) - padding_y)
+            x2 = int(target_x + text_width + padding_x)
+            y2 = int(y_center + (text_h / 2) + padding_y)
+
+            if diff >= 3.0:
+                draw.ellipse([x1, y1, x2, y2], outline=(255, 0, 0), width=2)
+            elif diff <= -3.0:
+                draw.ellipse([x1, y1, x2, y2], outline=(0, 140, 0), width=2)
+
+# ==========================================
+# 5. 檔名分析與主報告抬頭、子表格動態邊界標題繪製 (防空白對齊 Bug 優化版)
+# ==========================================
+def split_into_words(text):
+    """
+    依據空白鍵切分單字。若字與字中間沒有空白鍵，則視為同一個完整詞彙。
+    """
+    tokens = re.findall(r'\S+|\s+', text)
+    return [t for t in tokens if t]
+
+def get_filename_diff_strings(name1, name2, detected_type):
+    if detected_type == "Conducted":
+        prefix = "CE"
+    elif detected_type == "Radiated":
+        prefix = "RE"
+    else:
+        prefix = "EMI"
+        
+    name1_stem = os.path.splitext(name1)[0].strip()
+    name2_stem = os.path.splitext(name2)[0].strip()
+    
+    words1 = split_into_words(name1_stem)
+    words2 = split_into_words(name2_stem)
+    
+    s = difflib.SequenceMatcher(None, words1, words2)
+    
+    diff_A_parts, diff_B_parts = [], []
+    for tag, i1, i2, j1, j2 in s.get_opcodes():
+        if tag in ['replace', 'delete']: diff_A_parts.extend(words1[i1:i2])
+        if tag in ['replace', 'insert']: diff_B_parts.extend(words2[j1:j2])
+        
+    diff_A_str = "".join(diff_A_parts).strip()
+    diff_B_str = "".join(diff_B_parts).strip()
+    
+    # 直接由最終去空白後的字串來精準判定「包含關係」或「差異關係」
+    if diff_A_str and not diff_B_str:
+        return f"{prefix}比對：改{diff_A_str}.jpg"
+    elif diff_B_str and not diff_A_str:
+        return f"{prefix}比對：改{diff_B_str}.jpg"
+    elif not diff_A_str and not diff_B_str:
+        return f"{prefix}比對：{name1_stem}.jpg"
+    else:
+        return f"{prefix}比對：{diff_A_str} vs {diff_B_str}.jpg"
+
+def draw_centered_diff_report(final_img, name1, name2, dynamic_title, font_p, w):
+    draw = ImageDraw.Draw(final_img)
+    try:
+        title_font = ImageFont.truetype(font_p, 36) if font_p else ImageFont.load_default()
+        sub_font = ImageFont.truetype(font_p, 32) if font_p else ImageFont.load_default()
+    except Exception:
+        title_font = sub_font = ImageFont.load_default()
+    
+    display_title = f"【 {os.path.splitext(dynamic_title)[0]} 】"
+    draw.text((w // 2, 45), display_title, fill=(0, 0, 0), font=title_font, anchor="mm")
+    
+    words1 = split_into_words(name1)
+    words2 = split_into_words(name2)
+    
+    s = difflib.SequenceMatcher(None, words1, words2)
+    parts_A, parts_B = [("檔案 A (藍線): ", (0, 0, 0))], [("檔案 B (紅線): ", (0, 0, 0))]
+    
+    for tag, i1, i2, j1, j2 in s.get_opcodes():
+        subA = "".join(words1[i1:i2])
+        subB = "".join(words2[j1:j2])
+        if subA: parts_A.append((subA, (0, 102, 204) if tag in ['replace', 'delete'] else (0, 0, 0)))
+        if subB: parts_B.append((subB, (255, 0, 0) if tag in ['replace', 'insert'] else (0, 0, 0)))
+
+    for y_pos, parts in [(85, parts_A), (140, parts_B)]:
+        total_w = sum(draw.textlength(t, font=sub_font) for t, _ in parts)
+        x_cursor = (w - total_w) // 2
+        for text, color in parts:
+            draw.text((x_cursor, y_pos), text, fill=color, font=sub_font)
+            x_cursor += draw.textlength(text, font=sub_font)
+
+def draw_table_section_titles(draw, name1, name2, font_p, center_x_a, center_x_b, max_width, y_start):
+    try:
+        table_title_font = ImageFont.truetype(font_p, 20) if font_p else ImageFont.load_default()
+    except Exception:
+        table_title_font = ImageFont.load_default()
+        
+    words1 = split_into_words(name1)
+    words2 = split_into_words(name2)
+    s = difflib.SequenceMatcher(None, words1, words2)
+    
+    parts_A = []
+    for tag, i1, i2, j1, j2 in s.get_opcodes():
+        subA = "".join(words1[i1:i2])
+        if subA: parts_A.append((subA, (0, 102, 204) if tag in ['replace', 'delete'] else (0, 0, 0)))
+        
+    parts_B = []
+    for tag, i1, i2, j1, j2 in s.get_opcodes():
+        subB = "".join(words2[j1:j2])
+        if subB: parts_B.append((subB, (255, 0, 0) if tag in ['replace', 'insert'] else (0, 0, 0)))
+
+    def draw_dynamically_wrapped_title(draw_obj, parts, center_x, start_y, limit_w):
+        all_chars = []
+        for text, color in parts:
+            for char in text:
+                all_chars.append((char, color))
+                
+        lines = []
+        current_line = []
+        current_w = 0
+        
+        for char, color in all_chars:
+            char_w = draw_obj.textlength(char, font=table_title_font)
+            if current_w + char_w > (limit_w - 10):
+                lines.append(current_line)
+                current_line = [(char, color)]
+                current_w = char_w
+            else:
+                current_line.append((char, color))
+                current_w += char_w
+        if current_line:
+            lines.append(current_line)
+            
+        current_y = start_y
+        for line in lines:
+            line_str = "".join([pair[0] for pair in line])
+            line_total_w = draw_obj.textlength(line_str, font=table_title_font)
+            x_cursor = center_x - (line_total_w / 2)
+            for char, color in line:
+                draw_obj.text((x_cursor, current_y), char, fill=color, font=table_title_font)
+                x_cursor += draw_obj.textlength(char, font=table_title_font)
+            current_y += 28
+            
+        return current_y - start_y
+
+    h_a = draw_dynamically_wrapped_title(draw, parts_A, center_x_a, y_start, max_width)
+    h_b = draw_dynamically_wrapped_title(draw, parts_B, center_x_b, y_start, max_width)
+    
+    return max(h_a, h_b)
+
+# ==========================================
+# 6. 主產生流程
+# ==========================================
+def generate_compare_pdf(pdf_a_path, pdf_b_path, output_pdf_path, left_crop, right_crop, yaxis_start, yaxis_width):
+    imgA = render_pdf_to_image(pdf_a_path)
+    imgB = render_pdf_to_image(pdf_b_path)
+    if imgA.size != imgB.size: imgB = imgB.resize(imgA.size)
+    w, h = imgA.size
+    
+    crop_top = int(h * 0.08)        
+    wave_h = int(h * 0.55)          
+    
+    topA = imgA.crop((0, crop_top, w, wave_h))
+    topB = imgB.crop((0, crop_top, w, wave_h))
+    
+    if topA.size != topB.size:
+        topB = topB.resize(topA.size)
+        
+    overlap_top = ImageChops.multiply(apply_color_mask(topA, (0, 0, 255)), apply_color_mask(topB, (255, 0, 0)))
+    
+    bottomA_cleaned = process_bottom_custom_cut(imgA, wave_h, h, w, left_crop, right_crop, yaxis_start, yaxis_width)
+    bottomB_cleaned = process_bottom_custom_cut(imgB, wave_h, h, w, left_crop, right_crop, yaxis_start, yaxis_width)
+    
+    target_sub_w = int(w * 0.42)
+    scale_factor = target_sub_w / (bottomA_cleaned.width if bottomA_cleaned.width > 0 else 1)
+    target_sub_h = int(bottomA_cleaned.height * scale_factor)
+    
+    subA = apply_color_mask(bottomA_cleaned, (0, 50, 200)).resize((target_sub_w, target_sub_h))
+    subB = apply_color_mask(bottomB_cleaned, (200, 0, 50)).resize((target_sub_w, target_sub_h))
+    
+    data_A = extract_emi_table_data(pdf_a_path, os.path.basename(pdf_a_path))
+    data_B = extract_emi_table_data(pdf_b_path, os.path.basename(pdf_b_path))
+    
+    inject_margin_diffs_to_sub_image(subB, data_A, data_B, scale_factor, left_crop, wave_h, h, w, yaxis_start, yaxis_width, font_path)
+    
+    padding_side = int(w * 0.06)  
+    spacing = w - (2 * target_sub_w) - (2 * padding_side) 
+    
+    subA_x = padding_side
+    subB_x = padding_side + target_sub_w + spacing
+    
+    center_x_table_a = subA_x + (target_sub_w / 2)
+    center_x_table_b = subB_x + (target_sub_w / 2)
+    
+    temp_img = Image.new("RGB", (w, 300), (255, 255, 255))
+    temp_draw = ImageDraw.Draw(temp_img)
+    actual_title_h = draw_table_section_titles(
+        temp_draw, os.path.basename(pdf_a_path), os.path.basename(pdf_b_path), 
+        font_path, center_x_table_a, center_x_table_b, max_width=target_sub_w, y_start=15
+    )
+    title_space_h = actual_title_h + 30 
+    
+    bottom_combined = Image.new("RGB", (w, max(target_sub_h + title_space_h + 20, 540)), (255, 255, 255))
+    draw_bottom = ImageDraw.Draw(bottom_combined)
+    
+    draw_table_section_titles(
+        draw_bottom, os.path.basename(pdf_a_path), os.path.basename(pdf_b_path), 
+        font_path, center_x_table_a, center_x_table_b, max_width=target_sub_w, y_start=15
+    )
+    
+    bottom_combined.paste(subA, (subA_x, title_space_h))
+    bottom_combined.paste(subB, (subB_x, title_space_h))
+    
+    header_h = 210  
+    wave_section_h = wave_h - crop_top
+    center_gap = 40  
+    
+    total_h = header_h + wave_section_h + center_gap + bottom_combined.height
+    final_img = Image.new("RGB", (w, total_h), (255, 255, 255))
+    
+    draw_centered_diff_report(final_img, os.path.basename(pdf_a_path), os.path.basename(pdf_b_path), output_pdf_path, font_path, w)
+    final_img.paste(overlap_top, (0, header_h))
+    final_img.paste(bottom_combined, (0, header_h + wave_section_h + center_gap))
+    
+    final_img.save(output_pdf_path, "JPEG", quality=95)
+
+# ==========================================
+# 7. 全自動化執行流程
+# ==========================================
+if __name__ == '__main__':
+    if IN_COLAB:
+        from google.colab import files
+        print("=== 請選取兩份要比對的 EMI PDF 檔案 ===")
+        uploaded = files.upload()
+        pdf_files = [filename for filename in uploaded.keys() if filename.lower().endswith('.pdf')]
+    else:
+        pdf_files = sorted(glob.glob("*.pdf"))
+        pdf_files = [f for f in pdf_files if not any(k in os.path.basename(f) for k in ["EMI比對", "CE比對", "RE比對"])]
+
+    if len(pdf_files) == 2:
+        file_A, file_B = pdf_files[0], pdf_files[1]
+        
+        report_type_A = detect_emission_type(file_A)
+        report_type_B = detect_emission_type(file_B)
+        detected_type = report_type_A if report_type_A != "Unknown" else report_type_B
+        
+        if detected_type == "Conducted":
+            print("📝 偵測到報告類型為：Conducted Emission (傳導干擾)")
+            p_left_crop, p_right_crop, p_yaxis_start, p_yaxis_width = 0.047, 0.2075, 0.22, 0.40
+        else:
+            print("📝 偵測到報告類型為：Radiated Emission (輻射干擾)")
+            p_left_crop, p_right_crop, p_yaxis_start, p_yaxis_width = 0.047, 0.155, 0.20, 0.359
+            
+        output_name = get_filename_diff_strings(file_A, file_B, detected_type)
+        
+        print("\n" + "="*40)
+        print(f"🔹 基準檔案 A (藍線)：{file_A}")
+        print(f"🔺 比較檔案 B (紅線)：{file_B}")
+        print(f"🎯 計算結果預期：(檔案 B 數值) 減去 (檔案 A 數值)")
+        print("="*40 + "\n")
+        
+        print(f"[系統] 偵測完成！自動產生的比對檔名為：{output_name}")
+        
+        generate_compare_pdf(
+            file_A, file_B, output_name, 
+            left_crop=p_left_crop, 
+            right_crop=p_right_crop, 
+            yaxis_start=p_yaxis_start, 
+            yaxis_width=p_yaxis_width
+        )
+        
+        print("[系統] 報告製作完成！")
+        
+        if IN_COLAB:
+            print("[系統] 正在自動下載...")
+            files.download(output_name)
+            print("🎉 下載成功！")
+        else:
+            print(f"🎉 報告已儲存於本地端目錄：{os.path.abspath(output_name)}")
+    else:
+        if IN_COLAB:
+            print(f"\n❌ 錯誤：必須選取「剛好兩份」PDF！妳目前選了 {len(pdf_files)} 個。")
+        else:
+            print(f"\n❌ 錯誤：當前資料夾必須放置「剛好兩份」PDF 檔案進行比對！目前偵測到 {len(pdf_files)} 個。")
